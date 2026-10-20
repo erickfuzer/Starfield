@@ -107,9 +107,10 @@ Baixe o repositório pelo botão **Code → Download ZIP** e extraia.
 
 ```
 Starfield/
-├── index.html      # o wallpaper
-├── project.json    # configuração e controles do Wallpaper Engine
-├── preview.gif
+├── index.html          # o wallpaper
+├── project.json        # configuração e controles do Wallpaper Engine
+├── preview.gif         # prévia do README e do Wallpaper Engine
+├── social-preview.jpg  # imagem da prévia de link
 ├── LICENSE
 └── README.md
 ```
