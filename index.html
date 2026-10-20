@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Starfield</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; background: #000000; overflow: hidden; }
+    canvas { display: block; position: fixed; inset: 0; width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <canvas id="starfield"></canvas>
+  <script>
+    (function () {
+      'use strict';
+
+      // ───────────────────────────── Configuração ─────────────────────────────
+      // Qualquer chave pode ser sobrescrita pela URL, ex.: ?fps=60&ufos=0&seed=42
+      // Nos eventos, o valor é um multiplicador de frequência (2 = o dobro, 0 = desliga).
+      const CONFIG = {
+        fps:           30,       // limite de quadros (30 economiza CPU/GPU)
+        seed:          0,        // 0 = céu novo a cada carregamento; outro número = sempre o mesmo céu
+        starDensity:   0.00028,  // estrelas cintilantes por px²
+        backgroundStars: 0.3,    // estrelas fracas de fundo e da Via Láctea (0 desliga, 1 = denso)
+        milkyWay:      0.5,      // intensidade da Via Láctea (0 desliga)
+        nebulae:       0.55,     // intensidade das nebulosas (0 desliga)
+        galaxies:      1,        // intensidade das galáxias (0 desliga)
+        vignette:      0.55,     // escurecimento das bordas (0 desliga)
+        shootingStars: 1,
+        meteorShowers: 1,
+        satellites:    1,
+        starlink:      1,
+        airplanes:     1,
+        ufos:          1,
+      };
+      (function readUrlOverrides() {
+        const params = new URLSearchParams(location.search);
+        for (const key of Object.keys(CONFIG)) {
+          const v = parseFloat(params.get(key));
+          if (Number.isFinite(v)) CONFIG[key] = v;
+        }
+      })();
+
+      const canvas = document.getElementById('starfield');
+      const ctx    = canvas.getContext('2d');
+      let W = 0, H = 0, DPR = 1;
+      let bgLayer = null;          // céu estático pré-renderizado (Via Láctea, nebulosas, discos das galáxias...)
+      let vignetteGrad = null;
+      let stars = [], galaxies = [];
+      let shootingStars = [], satellites = [], starlinkTrains = [], airplanes = [], ufos = [];
+      let shower = null;           // chuva de meteoros ativa
+
+      // ─────────────────────────────── Aleatoriedade ───────────────────────────────
+      // PRNG com seed (mulberry32): a construção do céu usa seeds fixos, então o mesmo
+      // seed gera sempre o mesmo céu e um resize não embaralha galáxias/Via Láctea.
+      function mulberry32(a) {
+        return function () {
+          a |= 0; a = (a + 0x6D2B79F5) | 0;
+          let t = Math.imul(a ^ (a >>> 15), 1 | a);
+          t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+      // Sorteado uma vez por carregamento: mudar outras opções não troca o céu
+      const LOAD_SEED = Math.floor(Math.random() * 2 ** 31);
+      let rng = Math.random;
+      function withSeed(salt, fn) {
+        rng = mulberry32((CONFIG.seed || LOAD_SEED) * 31 + salt * 7919);
+        try { fn(); } finally { rng = Math.random; }
+      }
+      function rand(a, b) { return rng() * (b - a) + a; }
+      function pick(arr)  { return arr[Math.floor(rng() * arr.length)]; }
+      function gauss() {  // normal padrão (Box-Muller)
+        let u = 0;
+        while (u === 0) u = rng();
+        return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng());
+      }
+
+      // ──────────────────────────────── Paletas ────────────────────────────────
+      // Paletas azuladas — espirais próximas
+      const GALAXY_PALETTES_BLUE = [
+        { core: [255, 220, 140], disk: [120, 160, 255] }, // azul intenso
+        { core: [255, 210, 120], disk: [100, 150, 245] }, // azul vivo
+        { core: [245, 215, 130], disk: [140, 180, 255] }, // azul suave
+        { core: [250, 200, 110], disk: [130, 170, 240] }, // azul-índigo
+      ];
+      // Paletas quentes/neutras
+      const GALAXY_PALETTES_WARM = [
+        { core: [245, 200, 100], disk: [225, 215, 185] }, // dourado neutro
+        { core: [255, 225, 150], disk: [200, 185, 165] }, // creme
+        { core: [235, 185, 120], disk: [210, 190, 165] }, // âmbar
+        { core: [255, 230, 160], disk: [215, 210, 195] }, // branco-quente
+        { core: [220, 175, 110], disk: [195, 180, 160] }, // âmbar escuro
+      ];
+      // Paletas avermelhadas — galáxias distantes com redshift forte
+      const GALAXY_PALETTES_RED = [
+        { core: [255, 160,  80], disk: [200,  80,  60] }, // laranja-vermelho
+        { core: [255, 140,  60], disk: [180,  60,  40] }, // vermelho-laranja
+        { core: [240, 120,  70], disk: [160,  50,  50] }, // vermelho profundo
+        { core: [255, 170,  90], disk: [210,  90,  70] }, // coral
+      ];
+      // Paletas roxas/exóticas — galáxias com poeira ou interação
+      const GALAXY_PALETTES_EXOTIC = [
+        { core: [220, 180, 255], disk: [140,  80, 200] }, // roxo
+        { core: [200, 160, 255], disk: [100,  60, 180] }, // violeta
+        { core: [255, 200, 240], disk: [180,  80, 160] }, // rosa-púrpura
+      ];
+      // Nebulosas: cor do miolo (a) e das bordas (b)
+      const NEBULA_PALETTES = [
+        { a: [255,  80, 110], b: [255, 140, 170] }, // emissão H-alfa (vermelho/rosa)
+        { a: [235,  70, 100], b: [110, 190, 210] }, // H-alfa + OIII (rosa/ciano)
+        { a: [100, 140, 255], b: [170, 200, 255] }, // reflexão (azul)
+        { a: [170,  90, 230], b: [255, 120, 170] }, // roxo/magenta
+      ];
+      const METEOR_TINTS = [
+        [255, 255, 255], [255, 255, 255], [255, 255, 255],
+        [215, 255, 225], // esverdeado (magnésio)
+        [255, 225, 190], // alaranjado (sódio)
+        [215, 225, 255], // azulado (ferro/cálcio)
+      ];
+      const FIREBALL_TINTS = [[150, 255, 170], [255, 190, 120], [180, 200, 255]];
+      // Cores que o OVNI cicla — verde, azul, roxo, vermelho, branco, âmbar
+      const UFO_COLORS = [
+        [80,  255, 120], [60, 180, 255], [180, 80, 255],
+        [255,  60,  80], [255, 255, 255], [255, 200, 60],
+      ];
+
+      const SPECTRAL = [
+        { type:'M', rMin:0.28, rMax:0.65, rgb:[235, 200, 190], weight:18, glow:false },
+        { type:'K', rMin:0.30, rMax:0.75, rgb:[240, 215, 195], weight:16, glow:false },
+        { type:'G', rMin:0.32, rMax:0.85, rgb:[248, 235, 210], weight:20, glow:false },
+        { type:'F', rMin:0.38, rMax:1.00, rgb:[252, 245, 230], weight:18, glow:false },
+        { type:'A', rMin:0.50, rMax:1.20, rgb:[240, 245, 255], weight:16, glow:true  },
+        { type:'B', rMin:0.65, rMax:1.40, rgb:[210, 225, 255], weight: 9, glow:true  },
+        { type:'O', rMin:0.85, rMax:1.60, rgb:[185, 205, 255], weight: 3, glow:true  },
+      ];
+      const totalWeight = SPECTRAL.reduce((s, c) => s + c.weight, 0);
+      function pickClass() {
+        let roll = rng() * totalWeight;
+        for (const c of SPECTRAL) { roll -= c.weight; if (roll <= 0) return c; }
+        return SPECTRAL[0];
+      }
+
+      // ──────────────────────────────── Utilitários ────────────────────────────────
+      function clampByte(v) { return Math.max(0, Math.min(255, Math.round(v))); }
+      function jitter(rgb, amount = 8) { return rgb.map(v => clampByte(v + rand(-amount, amount))); }
+      function lerpRgb(a, b, t) { return a.map((v, i) => Math.round(v + (b[i] - v) * t)); }
+      // Avermelhamento aproximado pela distância (z = 0 → sem efeito)
+      function redshift(rgb, z) {
+        return [
+          clampByte(rgb[0] * (1 + z * 0.15)),
+          clampByte(rgb[1] * (1 - z * 0.08)),
+          clampByte(rgb[2] * (1 - z * 0.18)),
+        ];
+      }
+      // rgb pode ser array ou string "r,g,b" (arrays viram "r,g,b" no template)
+      function rgba(rgb, a) { return `rgba(${rgb},${Math.max(0, a).toFixed(3)})`; }
+
+      function dot(c, x, y, r, rgb, a) {
+        c.fillStyle = rgba(rgb, a);
+        c.beginPath();
+        c.arc(x, y, r, 0, Math.PI * 2);
+        c.fill();
+      }
+      // Mancha radial suave (decaimento quase gaussiano)
+      function softBlob(c, x, y, r, rgb, a) {
+        const g = c.createRadialGradient(x, y, 0, x, y, r);
+        g.addColorStop(0,   rgba(rgb, a));
+        g.addColorStop(0.4, rgba(rgb, a * 0.45));
+        g.addColorStop(1,   rgba(rgb, 0));
+        c.fillStyle = g;
+        c.fillRect(x - r, y - r, r * 2, r * 2);
+      }
+      // Mancha via sprite pré-renderizado (cache por cor). Usado nas camadas difusas:
+      // milhares de gradientes sobrepostos acumulam o dithering do navegador e formam
+      // uma "grade" visível; um sprite reescalado em posições aleatórias não.
+      const blobSprites = new Map();
+      function stamp(c, x, y, r, rgb, a) {
+        const key = rgb.map(v => Math.min(255, Math.round(v / 12) * 12)).join(',');
+        let spr = blobSprites.get(key);
+        if (!spr) {
+          spr = document.createElement('canvas');
+          spr.width = spr.height = 128;
+          softBlob(spr.getContext('2d'), 64, 64, 64, key, 1);
+          blobSprites.set(key, spr);
+        }
+        c.globalAlpha = Math.min(1, a);
+        c.drawImage(spr, x - r, y - r, r * 2, r * 2);
+        c.globalAlpha = 1;
+      }
+      // Canvas offscreen já escalado: desenha-se em px CSS, armazena em px físicos
+      function makeLayer(w, h, scale = DPR) {
+        const c = document.createElement('canvas');
+        c.width  = Math.max(1, Math.ceil(w * scale));
+        c.height = Math.max(1, Math.ceil(h * scale));
+        const x = c.getContext('2d');
+        x.scale(scale, scale);
+        return [c, x];
+      }
+      // Remove in-place os itens que não passam no filtro
+      function prune(arr, keep) {
+        let j = 0;
+        for (let i = 0; i < arr.length; i++) if (keep(arr[i])) arr[j++] = arr[i];
+        arr.length = j;
+      }
+      function onScreen(x, y, m) { return x > -m && x < W + m && y > -m && y < H + m; }
+      // Ponto numa borda aleatória + ângulo apontando pra dentro da tela
+      function edgeSpawn(margin, spread) {
+        const e = Math.floor(rand(0, 4));
+        let x, y;
+        if      (e === 0) { x = rand(0.05, 0.95) * W; y = -margin; }
+        else if (e === 1) { x = W + margin; y = rand(0.05, 0.95) * H; }
+        else if (e === 2) { x = rand(0.05, 0.95) * W; y = H + margin; }
+        else              { x = -margin; y = rand(0.05, 0.95) * H; }
+        const inward = [Math.PI / 2, Math.PI, -Math.PI / 2, 0][e];
+        return { x, y, angle: inward + rand(-spread, spread) };
+      }
+
+      // Spike de difração: 4 raios saindo do centro em ângulos fixos
+      // style 'cross' = 0°/90°, style 'diagonal' = 45°/135°
+      function drawDiffractionSpike(c, x, y, r, rgb, alpha, spikeStyle, len) {
+        const angles = spikeStyle === 'cross'
+          ? [0, Math.PI / 2]
+          : [Math.PI / 4, Math.PI * 3 / 4];
+        for (const baseAngle of angles) {
+          // cada ângulo gera 2 raios opostos = 4 pontas no total
+          for (const angle of [baseAngle, baseAngle + Math.PI]) {
+            const ex = x + Math.cos(angle) * len;
+            const ey = y + Math.sin(angle) * len;
+            const g  = c.createLinearGradient(x, y, ex, ey);
+            g.addColorStop(0,    rgba(rgb, alpha * 0.65));
+            g.addColorStop(0.25, rgba(rgb, alpha * 0.30));
+            g.addColorStop(1,    rgba(rgb, 0));
+            const perpX =  Math.sin(angle) * r * 0.25;
+            const perpY = -Math.cos(angle) * r * 0.25;
+            c.beginPath();
+            c.moveTo(x + perpX, y + perpY);
+            c.lineTo(ex, ey);
+            c.lineTo(x - perpX, y - perpY);
+            c.closePath();
+            c.fillStyle = g;
+            c.fill();
+          }
+        }
+      }
+
+      // ──────────────────────────────── Estrelas ────────────────────────────────
+      // Cada estrela vira um sprite (halo + núcleo) com alpha "cheio"; no loop basta
+      // um drawImage com globalAlpha = brilho atual. O spike tem sprite próprio,
+      // desenhado no comprimento máximo e reescalado a cada frame (cintilação).
+      const SPIKE_MIN = 22, SPIKE_MAX = 38;  // comprimento do spike, em raios da estrela
+      function makeStarSprite(s) {
+        const glowR = s.glow ? s.r * (s.type === 'O' ? 6 : s.type === 'B' ? 5 : 4) : 0;
+        const ext   = Math.ceil(Math.max(s.r, glowR)) + 1;
+        const [c, x] = makeLayer(ext * 2, ext * 2);
+        x.translate(ext, ext);
+        if (s.spike) {
+          const sExt = Math.ceil(s.r * SPIKE_MAX) + 1;
+          const [sc, sx] = makeLayer(sExt * 2, sExt * 2);
+          sx.translate(sExt, sExt);
+          drawDiffractionSpike(sx, 0, 0, s.r, s.rgb, 1, s.spikeStyle, s.r * SPIKE_MAX);
+          s.spikeSprite = sc;
+          s.spikeExt    = sExt;
+        }
+        if (glowR) {
+          const g = x.createRadialGradient(0, 0, 0, 0, 0, glowR);
+          g.addColorStop(0, rgba(s.rgb, 0.22));
+          g.addColorStop(1, rgba(s.rgb, 0));
+          x.fillStyle = g;
+          x.beginPath();
+          x.arc(0, 0, glowR, 0, Math.PI * 2);
+          x.fill();
+        }
+        dot(x, 0, 0, s.r, s.rgb, 1);
+        s.sprite = c;
+        s.ext    = ext;
+      }
+
+      function makeStar(cls, x, y, base, allowSpike) {
+        const r  = rand(cls.rMin, cls.rMax);
+        const sg = rng();
+        const speed = sg < 0.2  ? rand(0.002, 0.005)
+                    : sg < 0.85 ? rand(0.005, 0.018)
+                    :             rand(0.018, 0.035);
+        // brilhantes e quentes o bastante → 60% ganham spike
+        const spike = allowSpike && r > 0.8 && cls.glow && rng() < 0.60;
+        const s = {
+          x, y, r, base, speed,
+          offset: rand(0, Math.PI * 2),
+          rgb: redshift(jitter(cls.rgb), rand(0, 0.35)).join(','),
+          glow: cls.glow, type: cls.type, spike,
+          spikeStyle: rng() > 0.5 ? 'cross' : 'diagonal',
+        };
+        makeStarSprite(s);
+        return s;
+      }
+
+      function buildStars() {
+        stars = [];
+        const COUNT = Math.floor(W * H * CONFIG.starDensity);
+        for (let i = 0; i < COUNT; i++) {
+          stars.push(makeStar(pickClass(), rand(0, W), rand(0, H), rand(0.25, 0.90), true));
+        }
+        // Aglomerados: concentrações gaussianas de estrelas extras
+        const CLUSTERS = Math.floor(rand(6, 10));
+        for (let c = 0; c < CLUSTERS; c++) {
+          const cx = rand(0.05, 0.95) * W, cy = rand(0.05, 0.95) * H;
+          const radius = rand(0.04, 0.10) * Math.min(W, H);
+          const extra  = Math.floor(rand(8, 22));
+          for (let i = 0; i < extra; i++) {
+            const x = Math.max(0, Math.min(W, cx + gauss() * radius * 0.38));
+            const y = Math.max(0, Math.min(H, cy + gauss() * radius * 0.38));
+            stars.push(makeStar(pickClass(), x, y, rand(0.30, 0.95), false));
+          }
+        }
+      }
+
+      function drawStars(t) {
+        for (const s of stars) {
+          const a = s.base * (0.4 + 0.6 * Math.sin(t * s.speed + s.offset));
+          if (a <= 0.004) continue;  // fase "apagada" da cintilação
+          ctx.globalAlpha = a;
+          if (s.spikeSprite) {
+            // Cintilação atmosférica: o spike muda de comprimento a cada frame
+            const e = s.spikeExt * (Math.random() * (SPIKE_MAX - SPIKE_MIN) + SPIKE_MIN) / SPIKE_MAX;
+            ctx.drawImage(s.spikeSprite, s.x - e, s.y - e, e * 2, e * 2);
+          }
+          ctx.drawImage(s.sprite, s.x - s.ext, s.y - s.ext, s.ext * 2, s.ext * 2);
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      // ──────────────────────────────── Galáxias ────────────────────────────────
+      function buildGalaxies() {
+        galaxies = [];
+        if (CONFIG.galaxies <= 0) return;
+        const COUNT = Math.floor(rand(8, 15));
+        for (let i = 0; i < COUNT; i++) {
+          const depth      = rand(0, 1);
+          const elliptical = rng() < 0.25;
+          let palPool;
+          if (elliptical) {
+            palPool = rng() < 0.8 ? GALAXY_PALETTES_WARM : GALAXY_PALETTES_RED;
+          } else {
+            // 54% azuladas, 34% quentes, 8% vermelhas, 4% exóticas
+            const palRoll = rng();
+            if      (palRoll < 0.54) palPool = GALAXY_PALETTES_BLUE;
+            else if (palRoll < 0.88) palPool = GALAXY_PALETTES_WARM;
+            else if (palRoll < 0.96) palPool = GALAXY_PALETTES_RED;
+            else                     palPool = GALAXY_PALETTES_EXOTIC;
+          }
+          const pal = pick(palPool);
+
+          const sizeTier = rng();
+          const baseSize = sizeTier < 0.65 ? rand(4.0, 9.0)
+                         : sizeTier < 0.90 ? rand(9.0, 16.0)
+                         :                   rand(16.0, 24.0);
+          const viewAngle = rng();
+          const ryRatio = elliptical        ? rand(0.45, 0.95)
+                        : viewAngle < 0.25  ? rand(0.06, 0.16)   // de perfil
+                        : viewAngle < 0.55  ? rand(0.22, 0.50)
+                        :                     rand(0.55, 0.92);  // de frente
+
+          const gal = {
+            x: rand(0.05, 0.95) * W, y: rand(0.05, 0.95) * H,
+            size: baseSize * (1 - depth * 0.45),
+            ryRatio, depth, elliptical,
+            angle:   rand(0, Math.PI),
+            coreRgb: pal.core,
+            diskRgb: redshift(pal.disk, depth * 0.25),
+            alpha:   rand(0.55, 0.85) * (1 - depth * 0.40) * Math.min(1, CONFIG.galaxies),
+            arms:    rng() < 0.75 ? 2 : 3,
+            bar:     !elliptical && rng() < 0.35,
+            twist:   rand(2.6, 4.2),          // quanto os braços se enrolam (rad)
+            spin:    rng() < 0.5 ? 1 : -1,
+            pulseSpeed:  rand(0.0010, 0.0040),
+            pulseOffset: rand(0, Math.PI * 2),
+            pulseAmp:    rand(0.18, 0.38),
+          };
+          renderGalaxySprites(gal);
+          galaxies.push(gal);
+        }
+        galaxies.sort((a, b) => b.depth - a.depth);
+      }
+
+      // Faixa de poeira escura no plano do disco (galáxias vistas de perfil)
+      function cutDustLane(c, halfLen, th) {
+        c.save();
+        c.globalCompositeOperation = 'destination-out';
+        c.translate(0, th * 0.3);
+        const g = c.createLinearGradient(0, -th, 0, th);
+        g.addColorStop(0,   'rgba(0,0,0,0)');
+        g.addColorStop(0.5, 'rgba(0,0,0,0.8)');
+        g.addColorStop(1,   'rgba(0,0,0,0)');
+        c.fillStyle = g;
+        c.fillRect(-halfLen, -th, halfLen * 2, th * 2);
+        c.restore();
+      }
+
+      // Disco (estático, vai pro fundo) e núcleo (pulsa, desenhado por frame).
+      // Ambos em coordenadas locais da galáxia, antes da rotação/achatamento.
+      function renderGalaxySprites(gal) {
+        const { size, alpha, diskRgb, coreRgb } = gal;
+        const diskR  = size * 1.1;
+        const laneTh = diskR * 0.16;
+        const edgeOn = !gal.elliptical && gal.ryRatio < 0.2;
+
+        const S = Math.ceil(size * 2.8);
+        const [dc, d] = makeLayer(S * 2, S * 2);
+        d.translate(S, S);
+        const disk = d.createRadialGradient(0, 0, 0, 0, 0, diskR);
+        disk.addColorStop(0,    rgba(diskRgb, alpha * (gal.elliptical ? 0.75 : 0.55)));
+        disk.addColorStop(0.40, rgba(diskRgb, alpha * 0.28));
+        disk.addColorStop(0.75, rgba(diskRgb, alpha * 0.08));
+        disk.addColorStop(1,    rgba(diskRgb, 0));
+        d.fillStyle = disk;
+        d.fillRect(-S, -S, S * 2, S * 2);
+
+        if (!gal.elliptical) {
+          if (gal.bar) {
+            d.save();
+            d.scale(1, 0.28);
+            softBlob(d, 0, 0, diskR * 0.42, coreRgb, alpha * 0.35);
+            d.restore();
+          }
+          // Braços: manchas ao longo de espirais logarítmicas
+          const r0     = diskR * (gal.bar ? 0.38 : 0.14);
+          const growth = Math.log(diskR * 1.05 / r0) / gal.twist;
+          const armRgb = lerpRgb(diskRgb, [190, 210, 255], 0.25);
+          const steps  = Math.max(24, Math.round(diskR * 3));
+          const armPoint = (u, arm) => {
+            const th  = u * gal.twist;
+            const rr  = r0 * Math.exp(growth * th);
+            const ang = gal.spin * th + arm * Math.PI * 2 / gal.arms;
+            return [Math.cos(ang) * rr, Math.sin(ang) * rr];
+          };
+          for (let arm = 0; arm < gal.arms; arm++) {
+            for (let i = 0; i < steps; i++) {
+              const u = i / steps;
+              const [px, py] = armPoint(u, arm);
+              softBlob(d,
+                px + gauss() * diskR * 0.035, py + gauss() * diskR * 0.035,
+                diskR * rand(0.08, 0.16) * (1 - u * 0.4),
+                armRgb, alpha * 0.20 * Math.pow(1 - u, 0.7));
+            }
+          }
+          // Regiões de formação estelar: nós rosados/azulados sobre os braços
+          const knots = Math.round(gal.arms * steps * 0.12);
+          for (let i = 0; i < knots; i++) {
+            const [px, py] = armPoint(rand(0.15, 0.9), Math.floor(rng() * gal.arms));
+            softBlob(d,
+              px + gauss() * diskR * 0.03, py + gauss() * diskR * 0.03,
+              Math.max(0.5, diskR * 0.035),
+              rng() < 0.6 ? '255,150,190' : '170,200,255', alpha * 0.55);
+          }
+          if (edgeOn) cutDustLane(d, S, laneTh);
+        }
+        gal.disk  = dc;
+        gal.diskS = S;
+
+        const coreR = size * (gal.elliptical ? 0.55 : 0.42);
+        const C = Math.ceil(coreR);
+        const [cc, c] = makeLayer(C * 2, C * 2);
+        c.translate(C, C);
+        const g = c.createRadialGradient(0, 0, 0, 0, 0, coreR);
+        g.addColorStop(0,    rgba(coreRgb, 1));
+        g.addColorStop(0.45, rgba(coreRgb, 0.65));
+        g.addColorStop(0.80, rgba(coreRgb, 0.20));
+        g.addColorStop(1,    rgba(coreRgb, 0));
+        c.fillStyle = g;
+        c.fillRect(-C, -C, C * 2, C * 2);
+        if (edgeOn) cutDustLane(c, C, laneTh);
+        gal.core  = cc;
+        gal.coreS = C;
+      }
+
+      function paintGalaxyDisk(c, gal) {
+        c.save();
+        c.translate(gal.x, gal.y);
+        c.rotate(gal.angle);
+        c.scale(1, gal.ryRatio);
+        c.drawImage(gal.disk, -gal.diskS, -gal.diskS, gal.diskS * 2, gal.diskS * 2);
+        c.restore();
+      }
+
+      function drawGalaxyCores(t) {
+        for (const gal of galaxies) {
+          const pulse = 1 + gal.pulseAmp * Math.sin(t * gal.pulseSpeed + gal.pulseOffset);
+          ctx.save();
+          ctx.globalAlpha = Math.min(1, gal.alpha * 2.2 * pulse);
+          ctx.translate(gal.x, gal.y);
+          ctx.rotate(gal.angle);
+          ctx.scale(1, gal.ryRatio);
+          ctx.drawImage(gal.core, -gal.coreS, -gal.coreS, gal.coreS * 2, gal.coreS * 2);
+          ctx.restore();
+        }
+      }
+
+      // ─────────────────────────── Fundo estático ───────────────────────────
+      // Estrelas fracas de fundo (não cintilam) — dão profundidade ao céu
+      function paintDustStars(c) {
+        const n = Math.floor(W * H * 0.0011 * CONFIG.backgroundStars);
+        for (let i = 0; i < n; i++) {
+          dot(c, rand(0, W), rand(0, H), rand(0.18, 0.5), jitter(pickClass().rgb, 10), rand(0.06, 0.32));
+        }
+      }
+
+      // Via Láctea + nebulosas: camadas difusas em baixa resolução, depois ampliadas
+      function paintMilkyWayAndNebulae(c) {
+        const mw = CONFIG.milkyWay, neb = CONFIG.nebulae;
+        if (mw <= 0 && neb <= 0) return;
+        const LOW = 0.5;
+        const [gc, g] = makeLayer(W, H, LOW);  // brilho
+        const [dc, d] = makeLayer(W, H, LOW);  // máscara de poeira
+        g.globalCompositeOperation = 'lighter';
+
+        // Geometria da banda galáctica: atravessa a tela na diagonal, levemente curva
+        const diag   = Math.hypot(W, H);
+        const ang    = rand(0.35, 1.15) * (rng() < 0.5 ? 1 : -1);
+        const dir    = [Math.cos(ang), Math.sin(ang)];
+        const nrm    = [-dir[1], dir[0]];
+        const cx     = W * rand(0.35, 0.65), cy = H * rand(0.35, 0.65);
+        const bw     = Math.min(W, H) * rand(0.14, 0.22);  // meia-largura típica
+        const bulgeU = rand(-0.25, 0.25) * diag;            // onde fica o "centro galáctico"
+        const wavePh = rand(0, Math.PI * 2);
+        const bend   = u => Math.sin(u / diag * Math.PI * 1.2 + wavePh) * bw * 0.35;
+        const bulge  = u => Math.exp(-(((u - bulgeU) / (diag * 0.16)) ** 2));
+        const at     = (u, v) => {
+          const off = v + bend(u);
+          return [cx + dir[0] * u + nrm[0] * off, cy + dir[1] * u + nrm[1] * off];
+        };
+
+        if (mw > 0) {
+          const COOL = [175, 190, 235], WARM = [255, 214, 170];
+          const N = Math.round(diag * 0.9);
+          for (let i = 0; i < N; i++) {
+            const u  = rand(-0.6, 0.6) * diag;
+            const bf = bulge(u);
+            const v  = gauss() * bw * (0.45 + 0.35 * bf);
+            const [x, y] = at(u, v);
+            const fall = Math.exp(-(v * v) / (2 * (bw * 0.55) ** 2));
+            const col  = lerpRgb(COOL, WARM, Math.max(0, Math.min(1, bf * 1.1 + rand(-0.1, 0.1))));
+            stamp(g, x, y, bw * rand(0.18, 0.5) * (1 + bf * 0.4), col,
+              mw * 0.022 * (0.7 + 0.5 * bf) * fall * rand(0.5, 1.3));
+          }
+          // Poeira: a "Grande Fenda" — uma faixa principal e um ramo perto do bojo
+          const side  = rng() < 0.5 ? 1 : -1;
+          const lanes = [
+            { off: rand(-0.1, 0.1) * bw,          from: -0.6, to: 0.6 },
+            { off: rand(0.2, 0.35) * bw * side,   from: bulgeU / diag - rand(0.25, 0.4), to: bulgeU / diag + rand(0.05, 0.2) },
+          ];
+          for (const L of lanes) {
+            const n = Math.round(diag * 0.3 * (L.to - L.from));
+            for (let i = 0; i < n; i++) {
+              const [x, y] = at(rand(L.from, L.to) * diag, L.off + gauss() * bw * 0.10);
+              stamp(d, x, y, bw * rand(0.05, 0.16), [0, 0, 0], rand(0.06, 0.22));
+            }
+          }
+          // Nuvens escuras esparsas
+          for (let i = 0; i < 60; i++) {
+            const [x, y] = at(rand(-0.6, 0.6) * diag, gauss() * bw * 0.6);
+            stamp(d, x, y, bw * rand(0.08, 0.25), [0, 0, 0], rand(0.08, 0.3));
+          }
+        }
+
+        if (neb > 0) {
+          const count = Math.floor(rand(2, 5));
+          for (let n = 0; n < count; n++) {
+            const pal = pick(NEBULA_PALETTES);
+            // ~70% nascem perto do plano galáctico, como as reais
+            let x, y;
+            if (mw > 0 && rng() < 0.7) [x, y] = at(rand(-0.45, 0.45) * diag, gauss() * bw * 0.6);
+            else { x = rand(0.1, 0.9) * W; y = rand(0.1, 0.9) * H; }
+            const R = Math.min(W, H) * rand(0.05, 0.12);
+            // Vários passeios aleatórios saindo do centro → nuvem irregular com filamentos
+            const walkers = Math.floor(rand(3, 6));
+            for (let w = 0; w < walkers; w++) {
+              let px = x, py = y, heading = rand(0, Math.PI * 2);
+              const steps = Math.floor(rand(14, 26));
+              for (let i = 0; i < steps; i++) {
+                heading += rand(-0.7, 0.7);
+                px += Math.cos(heading) * R * 0.09 + (x - px) * 0.05;
+                py += Math.sin(heading) * R * 0.09 + (y - py) * 0.05;
+                const fade = 1 - i / steps * 0.6;
+                stamp(g, px, py, R * rand(0.25, 0.65) * fade, lerpRgb(pal.a, pal.b, i / steps), neb * 0.045 * rand(0.4, 1) * fade);
+              }
+            }
+            stamp(g, x, y, R * 0.7, pal.a, neb * 0.035);
+          }
+        }
+
+        // A poeira escurece tanto a banda quanto as nebulosas atrás dela
+        g.setTransform(1, 0, 0, 1, 0, 0);
+        g.globalCompositeOperation = 'destination-out';
+        g.drawImage(dc, 0, 0);
+
+        c.save();
+        c.globalCompositeOperation = 'lighter';
+        c.imageSmoothingQuality = 'high';
+        c.drawImage(gc, 0, 0, W, H);
+        c.restore();
+
+        // Estrelinhas concentradas na banda, também recortadas pela poeira
+        if (mw > 0) {
+          const [sc, s] = makeLayer(W, H);
+          const n = Math.floor(W * H * 0.0016 * mw * CONFIG.backgroundStars);
+          for (let i = 0; i < n; i++) {
+            const u = rand(-0.6, 0.6) * diag;
+            const [x, y] = at(u, gauss() * bw * (0.4 + 0.3 * bulge(u)));
+            if (!onScreen(x, y, 0)) continue;
+            dot(s, x, y, rand(0.15, 0.5), jitter(pickClass().rgb, 10), rand(0.08, 0.45));
+          }
+          s.setTransform(1, 0, 0, 1, 0, 0);
+          s.globalCompositeOperation = 'destination-out';
+          s.imageSmoothingQuality = 'high';
+          s.drawImage(dc, 0, 0, sc.width, sc.height);
+          c.drawImage(sc, 0, 0, W, H);
+        }
+      }
+
+      function renderBackground() {
+        const [bc, b] = makeLayer(W, H);
+        b.fillStyle = '#000000';
+        b.fillRect(0, 0, W, H);
+        withSeed(3, () => paintDustStars(b));
+        withSeed(4, () => paintMilkyWayAndNebulae(b));
+        for (const gal of galaxies) paintGalaxyDisk(b, gal);
+        bgLayer = bc;
+      }
+
+      // ─────────────────────────── Estrelas cadentes ───────────────────────────
+      // radiant (opcional): ponto de onde "saem" os meteoros de uma chuva
+      function spawnShootingStar(radiant) {
+        let x, y, angle, scale = 1;
+        if (radiant) {
+          angle = rand(0, Math.PI * 2);
+          const d = rand(30, 280);
+          x = radiant.rx + Math.cos(angle) * d;
+          y = radiant.ry + Math.sin(angle) * d;
+          scale = 0.35 + d / 280;  // perto do radiante os rastros são curtos (perspectiva)
+        } else {
+          ({ x, y, angle } = edgeSpawn(10, 0.6));
+        }
+        const fireball = !radiant && Math.random() < 0.08;  // bólido: raro, lento, colorido
+        const speed = fireball ? rand(14, 22) : rand(28, 48);
+        shootingStars.push({
+          x, y, angle,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          len:   (fireball ? rand(160, 260) : rand(60, 120)) * scale,
+          alpha: fireball ? 1 : rand(0.6, 1.0),
+          life:  1.0,  // 1=vivo, 0=morto
+          decay: fireball ? rand(0.006, 0.009) : radiant ? rand(0.025, 0.045) : rand(0.008, 0.016),
+          width: fireball ? rand(1.6, 2.4) : rand(0.5, 1.0),
+          rgb:   (fireball ? pick(FIREBALL_TINTS) : pick(METEOR_TINTS)).join(','),
+          fireball,
+        });
+      }
+
+      function startMeteorShower() {
+        shower = {
+          rx: rand(0.2, 0.8) * W, ry: rand(0.15, 0.6) * H,
+          left: Math.floor(rand(8, 16)),
+          next: 0,
+        };
+      }
+
+      function drawShootingStars(k) {
+        ctx.lineCap = 'round';
+        for (const s of shootingStars) {
+          const env   = Math.min(1, (1 - s.life) * 10 + 0.15);  // acende rápido ao surgir
+          const a     = s.alpha * s.life * env;
+          const tailX = s.x - Math.cos(s.angle) * s.len * s.life;
+          const tailY = s.y - Math.sin(s.angle) * s.len * s.life;
+          const g = ctx.createLinearGradient(tailX, tailY, s.x, s.y);
+          g.addColorStop(0, rgba(s.rgb, 0));
+          g.addColorStop(1, rgba(s.rgb, a));
+          ctx.beginPath();
+          ctx.moveTo(tailX, tailY);
+          ctx.lineTo(s.x, s.y);
+          ctx.strokeStyle = g;
+          ctx.lineWidth = s.width;
+          ctx.stroke();
+          // Cabeça incandescente
+          softBlob(ctx, s.x, s.y, s.width * (s.fireball ? 7 : 3.5), s.rgb, a * (s.fireball ? 0.7 : 0.45));
+
+          s.x    += s.vx * k;
+          s.y    += s.vy * k;
+          s.life -= s.decay * k;
+        }
+        prune(shootingStars, s => s.life > 0);
+      }
+
+      // ──────────────────────────────── Satélites ────────────────────────────────
+      function spawnSatellite() {
+        const { x, y, angle } = edgeSpawn(4, 0.7);
+        const speed = rand(1.2, 2.8);  // bem mais lento que cometa
+        satellites.push({
+          x, y,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          r:     rand(0.8, 1.4),
+          alpha: rand(0.55, 0.85),
+          // pisca levemente como painel solar refletindo luz
+          blinkSpeed:  rand(0.04, 0.12),
+          blinkOffset: rand(0, Math.PI * 2),
+          age: 0,
+          // ~30% entram na sombra da Terra no meio do caminho e somem
+          shadowAt: Math.random() < 0.30 ? rand(150, 500) : Infinity,
+          // ~12% fazem um "flare": o painel reflete o Sol direto e brilha forte por ~2s
+          flareAt:  Math.random() < 0.12 ? rand(80, 400) : Infinity,
+          flareDur: rand(45, 75),
+        });
+      }
+
+      function drawSatellites(t, k) {
+        const RGB = '220,230,255';
+        for (const s of satellites) {
+          s.age += k;
+          let a = s.alpha * (0.75 + 0.25 * Math.sin(t * s.blinkSpeed + s.blinkOffset));
+          if (s.age > s.shadowAt) a *= Math.max(0, 1 - (s.age - s.shadowAt) / 45);
+          let r = s.r;
+          const fp = (s.age - s.flareAt) / s.flareDur;
+          if (fp > 0 && fp < 1) {
+            const boost = Math.sin(Math.PI * fp) ** 2;
+            a  = Math.min(1, a * (1 + boost * 3));
+            r *= 1 + boost * 1.2;
+            softBlob(ctx, s.x, s.y, r * 7, RGB, boost * 0.5);
+          }
+          if (a > 0.003) dot(ctx, s.x, s.y, r, RGB, a);
+          s.x += s.vx * k;
+          s.y += s.vy * k;
+        }
+        prune(satellites, s => s.age < s.shadowAt + 45 && onScreen(s.x, s.y, 20));
+      }
+
+      // ───────────────────────────── Trens Starlink ─────────────────────────────
+      function spawnStarlinkTrain() {
+        const { x, y, angle } = edgeSpawn(10, 0.45);
+        const speed   = rand(1.0, 2.0);
+        const count   = Math.floor(rand(8, 18));
+        const spacing = rand(10, 18);
+        const r       = rand(0.7, 1.2);
+        // Ponto de separação — antes ficam mais juntos (deploy recente), depois espaçando
+        const splitAt = Math.floor(rand(count * 0.3, count * 0.7));
+        const sats = Array.from({ length: count }, (_, i) => {
+          const spread = i < splitAt
+            ? rand(0.3, 0.7)
+            : rand(1.0, 1.8) * (1 + (i - splitAt) * 0.08);
+          return {
+            along: spacing * i + (spread - 1) * spacing * i * 0.3 + rand(-1.5, 1.5),
+            side:  rand(-1.5, 1.5),
+            // Cintilação — só algumas (~40%) cintilam
+            twinkle:      Math.random() < 0.40,
+            twinkleSpeed: rand(0.06, 0.16),
+            twinkleOff:   rand(0, Math.PI * 2),
+            spike:        Math.random() < 0.20,
+            spikeStyle:   Math.random() > 0.5 ? 'cross' : 'diagonal',
+          };
+        });
+        starlinkTrains.push({
+          x, y, speed,
+          dx: Math.cos(angle), dy: Math.sin(angle),
+          sats,
+          tailAlong:   Math.max(...sats.map(s => s.along)),
+          travel:      0,
+          alpha:       rand(0.45, 0.75),
+          blinkSpeed:  rand(0.03, 0.08),
+          blinkOffset: rand(0, Math.PI * 2),
+          r,
+          // ~40%: o trem cruza a sombra da Terra e os satélites somem um a um no mesmo ponto
+          shadowAt: Math.random() < 0.40 ? rand(0.35, 0.75) * Math.hypot(W, H) : Infinity,
+        });
+      }
+
+      function drawStarlinkTrains(t, k) {
+        const RGB = '210,225,255';
+        for (const tr of starlinkTrains) {
+          const px = -tr.dy, py = tr.dx;  // perpendicular à direção
+          for (let i = 0; i < tr.sats.length; i++) {
+            const j = tr.sats[i];
+            const travelled = tr.travel - j.along;
+            const shade = travelled > tr.shadowAt ? 1 - (travelled - tr.shadowAt) / 30 : 1;
+            if (shade <= 0) continue;
+            const sx = tr.x - tr.dx * j.along + px * j.side;
+            const sy = tr.y - tr.dy * j.along + py * j.side;
+            if (!onScreen(sx, sy, 60)) continue;
+            const twinkleMod = j.twinkle
+              ? (0.55 + 0.45 * Math.sin(t * j.twinkleSpeed + j.twinkleOff))
+              : (0.82 + 0.18 * Math.sin(t * tr.blinkSpeed + tr.blinkOffset + i * 0.3));
+            const fade = Math.max(0.2, 1 - i * 0.030);
+            const a = tr.alpha * twinkleMod * fade * shade;
+            if (j.spike) drawDiffractionSpike(ctx, sx, sy, tr.r * 1.8, RGB, a * 0.7, j.spikeStyle, tr.r * 1.8 * rand(SPIKE_MIN, SPIKE_MAX));
+            dot(ctx, sx, sy, tr.r, RGB, a);
+          }
+          tr.x      += tr.dx * tr.speed * k;
+          tr.y      += tr.dy * tr.speed * k;
+          tr.travel += tr.speed * k;
+        }
+        // Despawn quando todos sumiram na sombra ou a CAUDA saiu da tela
+        prune(starlinkTrains, tr => {
+          if (tr.travel - tr.tailAlong > tr.shadowAt + 30) return false;
+          const tx = tr.x - tr.dx * tr.tailAlong;
+          const ty = tr.y - tr.dy * tr.tailAlong;
+          return !((tx < -40 && tr.dx < 0) || (tx > W + 40 && tr.dx > 0) ||
+                   (ty < -40 && tr.dy < 0) || (ty > H + 40 && tr.dy > 0));
+        });
+      }
+
+      // ──────────────────────────────── Aviões ────────────────────────────────
+      function spawnAirplane() {
+        const fromLeft = Math.random() < 0.5;
+        const angle = (fromLeft ? 0 : Math.PI) + rand(-0.3, 0.3);
+        const speed = rand(0.5, 1.1);
+        airplanes.push({
+          x: fromLeft ? -10 : W + 10,
+          y: rand(0.08, 0.8) * H,
+          dx: Math.cos(angle), dy: Math.sin(angle), speed,
+          span: rand(2.2, 3.6),       // meia-envergadura aparente
+          age: 0,
+          strobeOff: rand(0, 1300),
+          beaconOff: rand(0, 1000),
+        });
+      }
+
+      function drawAirplanes(k) {
+        for (const p of airplanes) {
+          p.age += k;
+          const ms = p.age * (1000 / 30);
+          // Luzes de navegação: vermelha na asa esquerda, verde na direita
+          const lx = p.dy, ly = -p.dx;
+          dot(ctx, p.x + lx * p.span, p.y + ly * p.span, 0.8, '255,60,60', 0.8);
+          dot(ctx, p.x - lx * p.span, p.y - ly * p.span, 0.8, '80,255,120', 0.8);
+          // Strobe branco: piscada dupla a cada ~1,3s
+          const sp = (ms + p.strobeOff) % 1300;
+          if (sp < 60 || (sp > 180 && sp < 240)) {
+            softBlob(ctx, p.x, p.y, 6, '255,255,255', 0.55);
+            dot(ctx, p.x, p.y, 1.1, '255,255,255', 1);
+          }
+          // Beacon vermelho na fuselagem, ~1x por segundo
+          const bp = ((ms + p.beaconOff) % 1000) / 1000;
+          if (bp < 0.15) dot(ctx, p.x - p.dx * 1.5, p.y - p.dy * 1.5, 0.9, '255,40,40', Math.sin(bp / 0.15 * Math.PI));
+
+          p.x += p.dx * p.speed * k;
+          p.y += p.dy * p.speed * k;
+        }
+        prune(airplanes, p => onScreen(p.x, p.y, 30));
+      }
+
+      // ──────────────────────────────── OVNIs ────────────────────────────────
+      function spawnUfo() {
+        const { x, y, angle } = edgeSpawn(8, 0.6);
+        ufos.push({
+          x, y, angle,
+          targetAngle: angle,
+          speed:       rand(1.5, 3.5),
+          speedTarget: rand(1.0, 4.5),
+          turnIn:      rand(40, 100),   // frames até a próxima mudança de direção
+          speedIn:     rand(60, 150),
+          colorIndex:  Math.floor(rand(0, UFO_COLORS.length)),
+          colorIn:     rand(8, 20),
+          pulseA:      rand(0.15, 0.30),  // pulso irregular: soma de duas frequências fixas
+          pulseB:      rand(0.03, 0.08),
+          alpha:       0,               // começa invisível, aparece gradualmente
+          r:           rand(1.2, 2.0),
+          age:         0,
+          maxAge:      rand(600, 1500), // depois disso ele dispara e some
+          leaving:     false,
+        });
+      }
+
+      function drawUfos(t, k) {
+        for (const u of ufos) {
+          u.age += k;
+          if (!u.leaving && u.age > u.maxAge) {
+            u.leaving     = true;
+            u.speedTarget = rand(10, 16);
+            u.targetAngle = rand(0, Math.PI * 2);
+          }
+          u.alpha = u.leaving
+            ? Math.max(0, u.alpha - 0.012 * k)
+            : Math.min(0.92, u.alpha + 0.02 * k);
+
+          if (!u.leaving) {
+            // Zigue-zague errático e variação de velocidade (às vezes paira parado)
+            if ((u.turnIn -= k) <= 0) {
+              u.targetAngle = rand(0, Math.PI * 2);
+              u.turnIn      = rand(30, 110);
+            }
+            if ((u.speedIn -= k) <= 0) {
+              u.speedTarget = Math.random() < 0.2 ? rand(0, 0.15) : rand(0.8, 4.5);
+              u.speedIn     = rand(40, 160);
+            }
+          }
+          // Gira pelo menor caminho até o ângulo alvo
+          const da = Math.atan2(Math.sin(u.targetAngle - u.angle), Math.cos(u.targetAngle - u.angle));
+          u.angle += da * Math.min(1, 0.12 * k);
+          u.speed += (u.speedTarget - u.speed) * Math.min(1, 0.05 * k);
+          u.x += Math.cos(u.angle) * u.speed * k;
+          u.y += Math.sin(u.angle) * u.speed * k;
+
+          if ((u.colorIn -= k) <= 0) {
+            u.colorIndex = (u.colorIndex + 1) % UFO_COLORS.length;
+            u.colorIn    = rand(6, 22);
+          }
+          const rgb   = UFO_COLORS[u.colorIndex];
+          const pulse = 0.6 + 0.4 * Math.abs(Math.sin(t * u.pulseA) * Math.cos(t * u.pulseB + u.r));
+          const a     = u.alpha * pulse;
+          softBlob(ctx, u.x, u.y, u.r * 5, rgb, a * 0.5);
+          dot(ctx, u.x, u.y, u.r, rgb, Math.min(1, a * 1.2));
+        }
+        prune(ufos, u => !(u.leaving && u.alpha <= 0) && onScreen(u.x, u.y, 30));
+      }
+
+      // ─────────────────────────────── Agendador ───────────────────────────────
+      // Tempos em segundos; o relógio só anda enquanto a página está visível.
+      const EVENTS = [
+        { key: 'shootingStars', every: [30, 50],    first: [5, 20],     spawn: () => spawnShootingStar() },
+        { key: 'satellites',    every: [50, 70],    first: [10, 40],    spawn: spawnSatellite },
+        { key: 'starlink',      every: [240, 330],  first: [120, 300],  spawn: spawnStarlinkTrain },
+        { key: 'airplanes',     every: [150, 300],  first: [60, 180],   spawn: spawnAirplane },
+        { key: 'ufos',          every: [300, 420],  first: [240, 420],  spawn: spawnUfo },
+        { key: 'meteorShowers', every: [900, 1500], first: [600, 1200], spawn: startMeteorShower },
+      ];
+      let clock = 0;  // ms simulados
+
+      function scheduleFirst(e) {
+        e.next = clock + rand(...e.first) * 1000 / Math.max(CONFIG[e.key], 0.01);
+      }
+      function resetSchedule() { EVENTS.forEach(scheduleFirst); }
+
+      function runScheduler() {
+        for (const e of EVENTS) {
+          if (clock < e.next) continue;
+          if (CONFIG[e.key] > 0) e.spawn();
+          e.next = clock + rand(...e.every) * 1000 / Math.max(CONFIG[e.key], 0.01);
+        }
+        if (shower && clock >= shower.next) {
+          spawnShootingStar(shower);
+          if (--shower.left <= 0) shower = null;
+          else shower.next = clock + rand(0.8, 4) * 1000;
+        }
+      }
+
+      // ─────────────────────────────── Ciclo principal ───────────────────────────────
+      function rebuild() {
+        DPR = Math.min(window.devicePixelRatio || 1, 2);
+        W = window.innerWidth;
+        H = window.innerHeight;
+        if (!W || !H) { bgLayer = null; return; }  // janela minimizada/oculta: espera o próximo resize
+        canvas.width  = Math.ceil(W * DPR);
+        canvas.height = Math.ceil(H * DPR);
+
+        withSeed(1, buildGalaxies);
+        withSeed(2, buildStars);
+        renderBackground();
+
+        ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        vignetteGrad = null;
+        if (CONFIG.vignette > 0) {
+          vignetteGrad = ctx.createRadialGradient(W / 2, H / 2, W * 0.28, W / 2, H / 2, W * 0.80);
+          vignetteGrad.addColorStop(0, 'rgba(0,0,0,0)');
+          vignetteGrad.addColorStop(1, `rgba(0,0,0,${CONFIG.vignette})`);
+        }
+
+        // Limpar eventos ativos e reagendar
+        shootingStars.length = satellites.length = starlinkTrains.length = 0;
+        airplanes.length = ufos.length = 0;
+        shower = null;
+        resetSchedule();
+      }
+
+      let FRAME_MS = 1000 / CONFIG.fps;
+      let lastDraw = 0;
+      let t = 0;  // tempo em "frames de 30fps" — mantém as velocidades originais
+
+      function frame(now) {
+        requestAnimationFrame(frame);
+        if (!bgLayer) return;
+        // Limita o fps (tolerância de 5% pra não pular frames válidos em 60/144Hz)
+        if (lastDraw && now - lastDraw < FRAME_MS * 0.95) return;
+        const dt = lastDraw ? Math.min(now - lastDraw, 100) : FRAME_MS;
+        lastDraw = now;
+        const k = dt / (1000 / 30);
+        t     += k;
+        clock += dt;
+
+        runScheduler();
+
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.drawImage(bgLayer, 0, 0);
+        ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+        drawGalaxyCores(t);
+        drawStars(t);
+
+        // Eventos — passam na frente de tudo
+        drawShootingStars(k);
+        drawSatellites(t, k);
+        drawStarlinkTrains(t, k);
+        drawAirplanes(k);
+        drawUfos(t, k);
+
+        // Vinheta por cima de tudo
+        if (vignetteGrad) {
+          ctx.fillStyle = vignetteGrad;
+          ctx.fillRect(0, 0, W, H);
+        }
+      }
+
+      let resizeTimer = 0;
+      function scheduleRebuild(delay) {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(rebuild, delay);
+      }
+      window.addEventListener('resize', () => scheduleRebuild(150));
+
+      // ───────────────────────────── Wallpaper Engine ─────────────────────────────
+      // As propriedades do project.json chegam aqui (o Engine passa as chaves em
+      // minúsculas). Eventos e fps mudam na hora; o resto reconstrói o céu.
+      const LIVE_KEYS = new Set(['fps', ...EVENTS.map(e => e.key)]);
+      function setFps(fps) {
+        if (fps > 0) { CONFIG.fps = fps; FRAME_MS = 1000 / fps; }
+      }
+      window.wallpaperPropertyListener = {
+        applyUserProperties(props) {
+          let needsRebuild = false;
+          for (const key of Object.keys(CONFIG)) {
+            const p = props[key.toLowerCase()];
+            if (!p || p.value === undefined) continue;
+            const v = typeof p.value === 'boolean' ? +p.value : parseFloat(p.value);
+            if (!Number.isFinite(v) || v === CONFIG[key]) continue;
+            if (key === 'fps') { setFps(v); continue; }
+            CONFIG[key] = v;
+            const ev = EVENTS.find(e => e.key === key);
+            if (ev) scheduleFirst(ev);  // reagenda com a nova frequência
+            if (!LIVE_KEYS.has(key)) needsRebuild = true;
+          }
+          if (needsRebuild) scheduleRebuild(100);
+        },
+        // Limite de FPS definido nas configurações gerais do Engine
+        applyGeneralProperties(props) {
+          if (props.fps) setFps(props.fps);
+        },
+      };
+
+      rebuild();
+      requestAnimationFrame(frame);
+    })();
+  </script>
+</body>
+</html>
