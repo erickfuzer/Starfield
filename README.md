@@ -20,7 +20,7 @@ Wallpaper animado de céu noturno feito com **HTML e JavaScript puros**: leve, p
 
 Um céu noturno procedural: cada vez que abre, nasce um céu diferente. O fundo é preto puro (`#000000`), ideal para telas OLED.
 
-## ✨ O que tem no céu
+## O que tem no céu
 
 **Fixo no fundo**
 - **Estrelas por classe espectral** (M, K, G, F, A, B e O), cada uma com cor, tamanho e frequência próprios, cintilando em ritmos diferentes
@@ -34,14 +34,14 @@ Um céu noturno procedural: cada vez que abre, nasce um céu diferente. O fundo 
 
 | Evento | Detalhe | Intervalo médio |
 |---|---|---|
-| ☄️ Estrela cadente | Cores pela composição do meteoro; às vezes um bólido lento e colorido | ~40 s |
-| 🛰️ Satélite | Pode dar um *flare* (reflexo do painel solar) ou sumir na sombra da Terra | ~1 min |
-| ✈️ Avião | Luzes de navegação vermelha e verde, strobe duplo e beacon | ~4 min |
-| 🚂 Trem Starlink | Fileira de satélites se espaçando, que às vezes some um a um na sombra | ~5 min |
-| 🛸 OVNI | Raro: movimento errático, cores piscando e saída em disparada | ~6 min |
-| 🌧️ Chuva de meteoros | 8 a 15 meteoros saindo do mesmo ponto do céu | ~20 min |
+| Estrela cadente | Cores pela composição do meteoro; às vezes um bólido lento e colorido | ~40 s |
+| Satélite | Pode dar um *flare* (reflexo do painel solar) ou sumir na sombra da Terra | ~1 min |
+| Avião | Luzes de navegação vermelha e verde, strobe duplo e beacon | ~4 min |
+| Trem Starlink | Fileira de satélites se espaçando, que às vezes some um a um na sombra | ~5 min |
+| OVNI | Raro: movimento errático, cores piscando e saída em disparada | ~6 min |
+| Chuva de meteoros | 8 a 15 meteoros saindo do mesmo ponto do céu | ~20 min |
 
-## 🎛️ Personalização
+## Personalização
 
 No **Wallpaper Engine**, tudo aparece como controle deslizante nas propriedades do wallpaper e muda sem reiniciar:
 
@@ -78,13 +78,13 @@ index.html?fps=60&seed=42&milkyWay=0.8&ufos=0&shootingStars=2
 
 </details>
 
-## ⚡ Desempenho
+## Desempenho
 
 - O céu estático (Via Láctea, nebulosas, discos das galáxias) é desenhado **uma única vez** e reaproveitado a cada quadro
 - Estrelas e núcleos de galáxias usam **sprites pré-renderizados**, sem recalcular gradientes no loop
 - **30 FPS por padrão**, e o relógio dos eventos só anda enquanto a página está visível
 
-## 🚀 Como usar
+## Como usar
 
 Baixe o repositório pelo botão **Code → Download ZIP** e extraia.
 
@@ -103,7 +103,7 @@ Baixe o repositório pelo botão **Code → Download ZIP** e extraia.
 <iframe src="index.html" style="position:fixed;inset:0;width:100%;height:100%;border:none;z-index:-1;"></iframe>
 ```
 
-## 📁 Estrutura
+## Estrutura
 
 ```
 Starfield/
@@ -114,11 +114,11 @@ Starfield/
 └── README.md
 ```
 
-## 🙏 Créditos
+## Créditos
 
 Desenvolvido com o auxílio do [Claude](https://claude.ai) (Anthropic) na arquitetura dos efeitos e na otimização do código.
 
-## 📄 Licença
+## Licença
 
 [MIT](LICENSE): use, modifique e distribua à vontade.
 
